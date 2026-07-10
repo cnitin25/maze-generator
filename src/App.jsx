@@ -73,6 +73,7 @@ const COLORS = {
   text: "#20303f",
   textMuted: "#8FA9C2",
   border: "rgba(1, 10, 17, 0.97)",
+  userInk: "#C0399F",
 };
 
 // ---------------------------------------------------------------------------
@@ -529,6 +530,13 @@ function sameGridCell(a, b) {
   return a[0] === b[0] && a[1] === b[1];
 }
 
+function polarGeometry(canvasSize, rings) {
+  const cx = canvasSize / 2;
+  const cy = canvasSize / 2;
+  const maxRadius = canvasSize / 2 - canvasSize * 0.04;
+  const ringThickness = maxRadius / rings;
+  return { cx, cy, maxRadius, ringThickness };
+}
 function polarWallWidth(canvasSize) {
   return Math.max(1.5, canvasSize * 0.0035);
 }
@@ -664,10 +672,7 @@ function drawMaze(ctx, maze, cellSize, showSolution) {
 
 function drawPolarMaze(ctx, maze, canvasSize, showSolution) {
   const { grid, rings, start, end, solutionPath } = maze;
-  const cx = canvasSize / 2;
-  const cy = canvasSize / 2;
-  const maxRadius = canvasSize / 2 - canvasSize * 0.04;
-  const ringThickness = maxRadius / rings;
+  const { cx, cy, ringThickness } = polarGeometry(canvasSize, rings);
   const cellCenter = (cell) => polarCellCenter(grid, ringThickness, cx, cy, cell);
 
   ctx.clearRect(0, 0, canvasSize, canvasSize);
@@ -734,6 +739,162 @@ function drawPolarMaze(ctx, maze, canvasSize, showSolution) {
 }
 
 // ---------------------------------------------------------------------------
+// User-drawn solving line
+// -----------------------
+// A free-hand overlay the player draws on top of the maze with mouse/touch
+// to trace their own solution attempt, kept entirely separate from the
+// generator's `solutionPath` (the dashed thread shown by "Show solution").
+//
+// "Edge detection" here means wall collision, not image processing: as the
+// pointer drags, every step is mapped back to a maze cell (gridCellAt /
+// polarCellAt) and checked against that cell's actual wall/link state
+// (cellsAdjacentOpen) before the ink is allowed to continue. If a drag would
+// cross a wall, the stroke simply stops — like a pen hitting a physical
+// wall — rather than snapping to the far side. The user has to release and
+// press again past the wall to keep tracing, so the drawing can never depict
+// a path the maze doesn't actually allow.
+// ---------------------------------------------------------------------------
+
+function gridCellAt(x, y, cellSize, cols, rows) {
+  const c = Math.min(Math.max(Math.floor(x / cellSize), 0), cols - 1);
+  const r = Math.min(Math.max(Math.floor(y / cellSize), 0), rows - 1);
+  return [r, c];
+}
+
+function gridCellsAdjacentOpen(grid, a, b) {
+  const dr = b[0] - a[0];
+  const dc = b[1] - a[1];
+  if (Math.abs(dr) + Math.abs(dc) !== 1) return false;
+  const dir = DIRS.find((d) => d.dr === dr && d.dc === dc);
+  return dir ? !grid[a[0]][a[1]][dir.name] : false;
+}
+
+// Inverse of polarAngleOf: given a raw pointer angle, finds which ring
+// sector it falls in. Grid cells are identified by [row, col]; polar cells
+// are identified by the actual live cell object (consistent with how
+// start/end/solutionPath already reference polar cells elsewhere in this
+// file), so no separate index math is needed once the object is found.
+function polarCellAt(x, y, grid, cx, cy, ringThickness, rings) {
+  const dx = x - cx;
+  const dy = y - cy;
+  const radius = Math.hypot(dx, dy);
+  const ringIndex = Math.min(Math.max(Math.floor(radius / ringThickness), 0), rings - 1);
+  const ring = grid[ringIndex];
+  let theta = Math.atan2(dy, dx) + Math.PI / 2;
+  theta = ((theta % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+  const idx = Math.min(Math.floor((theta / (Math.PI * 2)) * ring.length), ring.length - 1);
+  return ring[idx];
+}
+
+function polarCellsAdjacentOpen(a, b) {
+  if (a === b) return true;
+  if (a.cw === b || a.ccw === b || a.inward === b || a.outward.includes(b)) return a.links.has(b);
+  if (b.cw === a || b.ccw === a || b.inward === a || b.outward.includes(a)) return b.links.has(a);
+  return false;
+}
+
+function cellAt(maze, layout, point) {
+  if (maze.kind === "polar") {
+    const { cx, cy, ringThickness } = polarGeometry(layout.size, maze.rings);
+    return polarCellAt(point.x, point.y, maze.grid, cx, cy, ringThickness, maze.rings);
+  }
+  return gridCellAt(point.x, point.y, layout.cellSize, maze.cols, maze.rows);
+}
+
+function sameCell(maze, a, b) {
+  return maze.kind === "polar" ? a === b : sameGridCell(a, b);
+}
+
+function cellsAdjacentOpen(maze, a, b) {
+  return maze.kind === "polar" ? polarCellsAdjacentOpen(a, b) : gridCellsAdjacentOpen(maze.grid, a, b);
+}
+
+// Steps along the pixel segment from fromPoint to toPoint in small
+// increments (rather than just checking the endpoints) so a fast drag can't
+// skip clean over a thin wall between two non-adjacent cells without the
+// crossing being noticed. Calls onStep for every point that's still on the
+// allowed side, and onBlocked (once) the moment a step would cross a wall —
+// the caller stops extending the stroke at that point.
+function walkSegment(maze, layout, fromPoint, fromCell, toPoint, onStep, onBlocked) {
+  const stepSize =
+    maze.kind === "polar"
+      ? Math.max(2, polarGeometry(layout.size, maze.rings).ringThickness / 4)
+      : Math.max(2, layout.cellSize / 4);
+  const dist = Math.hypot(toPoint.x - fromPoint.x, toPoint.y - fromPoint.y);
+  const steps = Math.max(1, Math.ceil(dist / stepSize));
+  let curCell = fromCell;
+
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const p = { x: fromPoint.x + (toPoint.x - fromPoint.x) * t, y: fromPoint.y + (toPoint.y - fromPoint.y) * t };
+    const cell = cellAt(maze, layout, p);
+    if (!sameCell(maze, cell, curCell)) {
+      if (!cellsAdjacentOpen(maze, curCell, cell)) {
+        onBlocked();
+        return;
+      }
+      curCell = cell;
+    }
+    onStep(p, curCell);
+  }
+}
+
+function eraseRadius(maze, layout) {
+  return maze.kind === "polar" ? Math.max(6, layout.size * 0.02) : Math.max(6, layout.cellSize * 0.35);
+}
+
+// Removes every point of `stroke` within `radius` of the eraser position,
+// splitting the remainder into separate strokes at each gap (rubbing out
+// the middle of a line leaves two shorter lines, not one that jumps).
+function splitStrokeRemovingNear(stroke, point, radius) {
+  const radiusSq = radius * radius;
+  const groups = [];
+  let current = [];
+  for (const p of stroke) {
+    const dx = p.x - point.x;
+    const dy = p.y - point.y;
+    if (dx * dx + dy * dy <= radiusSq) {
+      if (current.length >= 2) groups.push(current);
+      current = [];
+    } else {
+      current.push(p);
+    }
+  }
+  if (current.length >= 2) groups.push(current);
+  return groups;
+}
+
+function userInkWidth(maze, layout) {
+  return maze.kind === "polar" ? Math.max(2, layout.size * 0.006) : Math.max(2, layout.cellSize * 0.12);
+}
+
+function drawUserStrokes(ctx, maze, layout, strokes) {
+  if (!strokes.length) return;
+  ctx.save();
+  ctx.strokeStyle = COLORS.userInk;
+  ctx.lineWidth = userInkWidth(maze, layout);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  for (const stroke of strokes) {
+    if (stroke.length < 2) continue;
+    ctx.beginPath();
+    stroke.forEach((p, i) => {
+      if (i === 0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    });
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function getCanvasPoint(canvas, e) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  return { x: (e.clientX - rect.left) * scaleX, y: (e.clientY - rect.top) * scaleY };
+}
+
+// ---------------------------------------------------------------------------
 // SVG export — mirrors the canvas drawing functions above, element for
 // element, so the exported file matches what's on screen.
 // ---------------------------------------------------------------------------
@@ -793,10 +954,7 @@ function buildGridSVG(maze, cellSize, showSolution) {
 
 function buildPolarSVG(maze, canvasSize, showSolution) {
   const { grid, rings, start, end, solutionPath } = maze;
-  const cx = canvasSize / 2;
-  const cy = canvasSize / 2;
-  const maxRadius = canvasSize / 2 - canvasSize * 0.04;
-  const ringThickness = maxRadius / rings;
+  const { cx, cy, ringThickness } = polarGeometry(canvasSize, rings);
   const cellCenter = (cell) => polarCellCenter(grid, ringThickness, cx, cy, cell);
 
   const pt = (r, a) => `${cx + Math.cos(a) * r},${cy + Math.sin(a) * r}`;
@@ -1085,10 +1243,20 @@ export default function MazeGenerator() {
   const [importedMaze, setImportedMaze] = useState(null);
   const [importError, setImportError] = useState(null);
   const [tickerOverflowing, setTickerOverflowing] = useState(false);
+  const [traceMode, setTraceMode] = useState("draw");
+  const [hasUserStrokes, setHasUserStrokes] = useState(false);
   const canvasRef = useRef(null);
   const fileInputRef = useRef(null);
   const tickerContainerRef = useRef(null);
   const tickerMeasureRef = useRef(null);
+  // Committed strokes + the one currently being dragged, kept in refs rather
+  // than state — pointermove can fire dozens of times/sec and each stroke
+  // just needs to get onto the canvas, not trigger a React re-render.
+  const userStrokesRef = useRef([]);
+  const activeStrokeRef = useRef(null);
+  const traceBlockedRef = useRef(false);
+  const pointerActiveRef = useRef(false);
+  const prevMazeRef = useRef(null);
 
   // Pure function of (difficulty, shape, seed) — same seed always reproduces
   // the same maze. `importedMaze`, when present, takes over the display
@@ -1105,21 +1273,124 @@ export default function MazeGenerator() {
 
   const maze = importedMaze ?? generatedMaze;
 
-  useEffect(() => {
-    if (!canvasRef.current) return;
+  // Redraws the maze (+ solution thread, if shown) then layers the user's
+  // traced strokes on top, including whichever stroke is mid-drag. Called
+  // both from the effect below and imperatively from the pointer handlers,
+  // so a drag can repaint without going through a React re-render each step.
+  const redraw = () => {
     const canvas = canvasRef.current;
+    if (!canvas) return;
     const ctx = canvas.getContext("2d");
     const layout = getLayout(maze);
-    if (layout.kind === "polar") {
-      canvas.width = layout.size;
-      canvas.height = layout.size;
-      drawPolarMaze(ctx, maze, layout.size, showSolution);
-    } else {
-      canvas.width = maze.cols * layout.cellSize;
-      canvas.height = maze.rows * layout.cellSize;
-      drawMaze(ctx, maze, layout.cellSize, showSolution);
+    if (layout.kind === "polar") drawPolarMaze(ctx, maze, layout.size, showSolution);
+    else drawMaze(ctx, maze, layout.cellSize, showSolution);
+    const strokes = activeStrokeRef.current
+      ? [...userStrokesRef.current, activeStrokeRef.current.points]
+      : userStrokesRef.current;
+    drawUserStrokes(ctx, maze, layout, strokes);
+  };
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    // A genuinely new/imported maze invalidates the traced line (different
+    // wall geometry, possibly different canvas size) — but merely toggling
+    // "Show solution" shouldn't wipe what the user has drawn.
+    if (prevMazeRef.current !== maze) {
+      prevMazeRef.current = maze;
+      userStrokesRef.current = [];
+      activeStrokeRef.current = null;
+      traceBlockedRef.current = false;
+      pointerActiveRef.current = false;
+      setHasUserStrokes(false);
+
+      const layout = getLayout(maze);
+      if (layout.kind === "polar") {
+        canvas.width = layout.size;
+        canvas.height = layout.size;
+      } else {
+        canvas.width = maze.cols * layout.cellSize;
+        canvas.height = maze.rows * layout.cellSize;
+      }
     }
+
+    redraw();
   }, [maze, showSolution]);
+
+  const handlePointerDown = (e) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.setPointerCapture(e.pointerId);
+    pointerActiveRef.current = true;
+    traceBlockedRef.current = false;
+    const layout = getLayout(maze);
+    const point = getCanvasPoint(canvas, e);
+
+    if (traceMode === "erase") {
+      const radius = eraseRadius(maze, layout);
+      userStrokesRef.current = userStrokesRef.current.flatMap((s) => splitStrokeRemovingNear(s, point, radius));
+      setHasUserStrokes(userStrokesRef.current.length > 0);
+    } else {
+      activeStrokeRef.current = { cell: cellAt(maze, layout, point), points: [point] };
+    }
+    redraw();
+  };
+
+  const handlePointerMove = (e) => {
+    if (!pointerActiveRef.current) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const layout = getLayout(maze);
+    const point = getCanvasPoint(canvas, e);
+
+    if (traceMode === "erase") {
+      const radius = eraseRadius(maze, layout);
+      userStrokesRef.current = userStrokesRef.current.flatMap((s) => splitStrokeRemovingNear(s, point, radius));
+      setHasUserStrokes(userStrokesRef.current.length > 0);
+      redraw();
+      return;
+    }
+
+    if (!activeStrokeRef.current || traceBlockedRef.current) return;
+    const active = activeStrokeRef.current;
+    const fromPoint = active.points[active.points.length - 1];
+    walkSegment(
+      maze,
+      layout,
+      fromPoint,
+      active.cell,
+      point,
+      (p, newCell) => {
+        active.points.push(p);
+        active.cell = newCell;
+      },
+      () => {
+        traceBlockedRef.current = true;
+      }
+    );
+    redraw();
+  };
+
+  const handlePointerUp = (e) => {
+    const canvas = canvasRef.current;
+    if (canvas?.hasPointerCapture?.(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+    if (traceMode === "draw" && activeStrokeRef.current && activeStrokeRef.current.points.length >= 2) {
+      userStrokesRef.current = [...userStrokesRef.current, activeStrokeRef.current.points];
+      setHasUserStrokes(true);
+    }
+    activeStrokeRef.current = null;
+    traceBlockedRef.current = false;
+    pointerActiveRef.current = false;
+    redraw();
+  };
+
+  const handleClearTrace = () => {
+    userStrokesRef.current = [];
+    activeStrokeRef.current = null;
+    setHasUserStrokes(false);
+    redraw();
+  };
 
   const handleDifficultyChange = (key) => {
     setDifficulty(key);
@@ -1375,8 +1646,9 @@ export default function MazeGenerator() {
           borderRadius: 10,
           padding: 16,
           display: "flex",
+          flexDirection: "column",
           alignItems: "center",
-          justifyContent: "center",
+          gap: 12,
         }}
       >
         <canvas
@@ -1384,9 +1656,47 @@ export default function MazeGenerator() {
           role="img"
           aria-label={`Generated maze, ${
             maze.kind === "polar" ? `${maze.rings} rings` : `${maze.cols} by ${maze.rows} cells`
-          }${showSolution ? ", solution path shown" : ""}`}
-          style={{ display: "block", borderRadius: 4 }}
+          }${showSolution ? ", solution path shown" : ""}${hasUserStrokes ? ", with a traced path drawn on it" : ""}`}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
+          style={{
+            display: "block",
+            borderRadius: 4,
+            touchAction: "none",
+            cursor: traceMode === "erase" ? "cell" : "crosshair",
+          }}
         />
+
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 12, color: COLORS.textMuted, marginRight: 4 }}>Trace your path</span>
+          <button
+            style={segButton(traceMode === "draw")}
+            aria-pressed={traceMode === "draw"}
+            onClick={() => setTraceMode("draw")}
+          >
+            Draw
+          </button>
+          <button
+            style={segButton(traceMode === "erase")}
+            aria-pressed={traceMode === "erase"}
+            onClick={() => setTraceMode("erase")}
+          >
+            Erase
+          </button>
+          <button
+            style={{
+              ...segButton(false),
+              opacity: hasUserStrokes ? 1 : 0.5,
+              cursor: hasUserStrokes ? "pointer" : "default",
+            }}
+            onClick={handleClearTrace}
+            disabled={!hasUserStrokes}
+          >
+            Clear line
+          </button>
+        </div>
       </div>
       </div>
 
